@@ -1,0 +1,83 @@
+%% ============================================
+% 已知量
+% P_x           : 目标在月心月固系(MCMF)下的固定坐标 [3x1]
+% t1            : 发射时刻
+% c0            : 光速
+% x_par_radar   : 雷达x(t)三阶拟合系数 [1x4]
+% y_par_radar   : 雷达y(t)三阶拟合系数 [1x4]
+% z_par_radar   : 雷达z(t)三阶拟合系数 [1x4]
+%
+% 欧拉角拟合系数：
+% psi(t)   = d_psi*t^3   + c_psi*t^2   + b_psi*t   + a_psi
+% theta(t) = d_theta*t^3 + c_theta*t^2 + b_theta*t + a_theta
+% phi(t)   = d_phi*t^3   + c_phi*t^2   + b_phi*t   + a_phi
+%% ---------- 欧拉角函数 ----------
+psi_fun   = @(t) d_psi   * t.^3 + c_psi   * t.^2 + b_psi   * t + a_psi;
+theta_fun = @(t) d_theta * t.^3 + c_theta * t.^2 + b_theta * t + a_theta;
+phi_fun   = @(t) d_phi   * t.^3 + c_phi   * t.^2 + b_phi   * t + a_phi;
+%% ---------- 基本旋转矩阵 ----------
+Rz = @(ang) [ cos(ang), sin(ang), 0;
+              -sin(ang),  cos(ang), 0;
+                   0   ,      0   , 1 ];
+Rx = @(ang) [1,     0     ,      0    ;
+             0, cos(ang), sin(ang);
+             0, -sin(ang),  cos(ang)];
+%% ---------- 月固系 -> MCI 的旋转矩阵函数 ----------
+R_mcmf2mci = @(t) Rz(psi_fun(t)) * Rx(theta_fun(t)) * Rz(phi_fun(t));
+%% ---------- 目标在 t 时刻的 MCI 坐标函数 ----------
+pt_fun = @(t) R_mcmf2mci(t) * P_x;
+%% ---------- 构造方程4：去程延时方程 ----------
+% || pt(t2) - pr(t1) || = c0 * (t2 - t1)
+fun_t2 = @(t) norm(pt_fun(t) - pr_t1) - c0 * (t - t1);
+%% ---------- 初值 ----------
+% 可直接用“t1 + 场景中心单程传播时延”；
+% 若当前只想先跑通程序，也可先用 P_x 对应的近似单程斜距构造初值
+R1_init = norm(pt_fun(t1) - pr_t1);
+t2_init = t1 + R1_init / c0;
+%% ---------- 求解 t2 ----------
+t222 = fzero(fun_t2, t2_init);
+%% ---------- 求解完成后，得到 t2 时刻目标在 MCI 下的坐标 ----------
+pt_t2 = pt_fun(t222);
+%% ---------- 去程斜距 ----------
+R1 = norm(pt_t2 - pr_t1);
+R1_check = c0 * (t222 - t1);
+%% ---------- 输出 ----------
+fprintf('\n===== Solve t2 by Eq.(F4) =====\n');
+fprintf('t1       = %.12f s\n', t1);
+fprintf('t2       = %.12f s\n', t222);
+fprintf('R1       = %.6f m\n', R1);
+fprintf('R1_check = %.6f m\n', R1_check);
+fprintf('abs(R1 - R1_check) = %.6e m\n', abs(R1 - R1_check));
+%% =========================
+% 8. 求解 t3 和回程斜距 R2
+%    方程：|| pr(t3) - pt(t2) || = c0 * (t3 - t2)
+% =========================
+% ---------- 雷达在 t3 时刻的 MCI 坐标函数 ----------
+xr_t3 = @(t) x_par_radar(1)*t.^3 + x_par_radar(2)*t.^2 + x_par_radar(3)*t + x_par_radar(4);
+yr_t3 = @(t) y_par_radar(1)*t.^3 + y_par_radar(2)*t.^2 + y_par_radar(3)*t + y_par_radar(4);
+zr_t3 = @(t) z_par_radar(1)*t.^3 + z_par_radar(2)*t.^2 + z_par_radar(3)*t + z_par_radar(4);
+
+% ---------- 构造求解 t3 的方程 ----------
+% ||pr(t3) - pt(t2)|| = c0 * (t3 - t2)
+fun_t3 = @(t) sqrt( ...
+    (xr_t3(t) - pt_t2(1)).^2 + ...
+    (yr_t3(t) - pt_t2(2)).^2 + ...
+    (zr_t3(t) - pt_t2(3)).^2 ) ...
+    - c0 * (t - t222);
+% ---------- t3 初值 ----------
+t3_init = t1 + 2*R1/c0;
+
+% ---------- 用 fzero 求解 t3 ----------
+t3 = fzero(fun_t3, t3_init);
+% ---------- 雷达在 t3 时刻的 MCI 坐标 ----------
+pr_t3 = [xr_t3(t3); yr_t3(t3); zr_t3(t3)];
+
+% ---------- 第二程斜距 R2 ----------
+R2 = norm(pr_t3 - pt_t2);
+
+% ---------- 校验 ----------
+R2_check = c0 * (t3 - t222);
+
+% ---------- 双程斜距 ----------
+R = R1 + R2;
+
