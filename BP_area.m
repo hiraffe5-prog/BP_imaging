@@ -1,5 +1,8 @@
 % BP对月成像处理
 clc,clear,close all
+if isempty(gcp('nocreate'))
+    parpool;
+end
 addpath 'C:\Users\eric\Desktop\月球面目标仿真代码\子函数'
 %% 参数设置
 c = 299792458;
@@ -137,10 +140,18 @@ ParaCBP.deltaR = dr;
 ParaCBP.Na = Na;
 ParaCBP.NrInterp = Nr_up;
 ParaCBP.Lambda = lambda;
+ParaCBP.c0 = c;
+ParaCBP.Tr = Tr;
+ParaCBP.x_par_radar = x_par_radar;
+ParaCBP.y_par_radar = y_par_radar;
+ParaCBP.z_par_radar = z_par_radar;
+ParaCBP.a_psi=a_psi; ParaCBP.b_psi=b_psi; ParaCBP.c_psi=c_psi;ParaCBP.d_psi=d_psi;
+ParaCBP.a_theta=a_theta;ParaCBP.b_theta=b_theta; ParaCBP.c_theta=c_theta;ParaCBP.d_theta=d_theta;
+ParaCBP.a_phi=a_phi; ParaCBP.b_phi=b_phi; ParaCBP.c_phi=c_phi; ParaCBP.d_phi=d_phi;
 
-x_pos = pos_xyz(1,1:ParaCBP.Na);
-y_pos = pos_xyz(2,1:ParaCBP.Na);
-z_pos = pos_xyz(3,1:ParaCBP.Na);
+% x_pos = pos_xyz(1,1:ParaCBP.Na);
+% y_pos = pos_xyz(2,1:ParaCBP.Na);
+% z_pos = pos_xyz(3,1:ParaCBP.Na);
 
 % lon_range=[-13.5,-8.5];
 % lat_range=[-40.5,-45.5];
@@ -166,8 +177,8 @@ Scene_X = XX;
 Scene_Y = YY;
 Scene_Z = ZZ;
 
-[amsum,amsum_new,rp_middle] = Func_CBP_2D_GPU( sig(1:ParaCBP.Na,:),ParaCBP,Scene_X,Scene_Y,Scene_Z,x_pos,y_pos,z_pos);
-
+% [amsum,amsum_new,rp_middle] = Func_CBP_2D_GPU( sig(1:ParaCBP.Na,:),ParaCBP,Scene_X,Scene_Y,Scene_Z,x_pos,y_pos,z_pos);
+[amsum,amsum_new,rp_middle] = Func_CBP_2D_GPU_nsg( sig(1:ParaCBP.Na,:),ParaCBP,Scene_X,Scene_Y,Scene_Z);
 % 显示
 figure,imagesc(lon,lat,abs(amsum))
 set(gca,'YDir','normal'),xlabel('经度/deg'),ylabel('纬度/deg'),title('BP成像')
