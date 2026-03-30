@@ -1,221 +1,231 @@
-function [amsum,amsum_new,rp_middle] = Func_CBP_2D_GPU_nsg(s1,ParaCBP,xp2,yp2,zp2,x_pos,y_pos,z_pos)
-% 非停走BP
-% 说明：
-% 1) 这里对每个网格点、每个PRT，先求非停走条件下的等效单程斜距 Rm = (R1+R2)/2
-% 2) 再按照原BP代码的思路，在第i个方位向上取 rp = Rm(:,:,i) 进行距离索引与相参积累
-% 3) 相位补偿时，取中间方位向时刻对应的 rp_middle = Rm(:,:,round(Na/2)+1)
+function [amsum, amsum_new, rp_middle] = Func_CBP_2D_GPU_nsg_2(sig, ParaCBP, Scene_X, Scene_Y, Scene_Z)
+% 非“停-走”二维CBP（GPU积累版）
+% 改写要点：
+% 1) 不再一次性计算并存储 Rm_all(:,:,1:Na)
+% 2) 改为每个慢时间 i 单独计算当前 rp(:,:,i)，然后立即参与BP积累
+% 3) 单像素函数只求第 i 个慢时间对应的等效单程斜距
 %
-% 需要在 ParaCBP 中额外提供以下字段：
-%   ParaCBP.c0
-%   ParaCBP.Tr
-%   ParaCBP.x_par_radar
-%   ParaCBP.y_par_radar
-%   ParaCBP.z_par_radar
-%   ParaCBP.a_psi, ParaCBP.b_psi, ParaCBP.c_psi, ParaCBP.d_psi
-%   ParaCBP.a_theta, ParaCBP.b_theta, ParaCBP.c_theta, ParaCBP.d_theta
-%   ParaCBP.a_phi, ParaCBP.b_phi, ParaCBP.c_phi, ParaCBP.d_phi
+% 输入：
+%   sig      : 距离压缩后的回波数据，大小 [Na, Nr_up]
+%   ParaCBP  : 参数结构体
+%   Scene_X  : 成像网格X坐标 [Ny, Nx]
+%   Scene_Y  : 成像网格Y坐标 [Ny, Nx]
+%   Scene_Z  : 成像网格Z坐标 [Ny, Nx]
+%
+% 输出：
+%   amsum    : 复图像（聚焦结果）
+%   amsum_new: 相位补偿后的图像
+%   rp_middle: 中间慢时间对应的等效单程斜距 [Ny, Nx]
+%
+% 注意：
+% 1) 这里默认 ParaCBP 中已有下列字段：
+%    Na, Tr, c0, lambda, r_start, delta_r
+%    x_par_radar, y_par_radar, z_par_radar
+%    a_psi,b_psi,c_psi,d_psi
+%    a_theta,b_theta,c_theta,d_theta
+%    a_phi,b_phi,c_phi,d_phi
+%
+% 2) 如果你的原始 ParaCBP 字段名与这里不一致，需要把下面对应位置改成你的字段名。
+%
+% 3) 如果你的原始 amsum_new 不是 abs(amsum)，只需要改最后几行输出部分即可。
 
-r_start = ParaCBP.Rmin;
-delta_r = ParaCBP.deltaR;
-Na      = ParaCBP.Na;
-Nr_up   = ParaCBP.NrInterp;
-lambda  = ParaCBP.Lambda;
+    %% ---------------- 基本参数 ----------------
+    r_start = ParaCBP.Rmin;
+    delta_r = ParaCBP.deltaR;
+    Na      = ParaCBP.Na;
+    Nr_up   = ParaCBP.NrInterp;
+    lambda  = ParaCBP.Lambda;
+    
+    xp2 = Scene_X;
+    yp2 = Scene_Y;
+    zp2 = Scene_Z;
 
-%% ============================================================
-% 先在CPU上计算所有网格点、所有PRT对应的非停走等效单程斜距
-% Rm_all 大小与 xp2 一致，并在第3维上对应慢时间
-%% ============================================================
-disp('开始计算所有网格点的非停走等效单程斜距 Rm ...');
+    %% ---------------- 转GPU ----------------
+    s1 = gpuArray(sig);
 
-Rm_all = calc_Rm_all_nonstopgo(xp2, yp2, zp2, ParaCBP);   % [Ny, Nx, Na]
+    % 复数累加器
+    amsum_gpu = gpuArray.zeros(size(xp2));   % 存储幅度
 
+    %% ---------------- 进度条 ----------------
+    h = waitbar(0, '初始化中...', 'Name', '非停走CBP处理中');
+    t_start = tic;
 
-%% 转到GPU做BP积累
-s1     = gpuArray(s1);
-Rm_all = gpuArray(Rm_all);
+    cleanupObj = onCleanup(@() safeCloseWaitbar(h));
 
-h = waitbar(0,'1','Name','bp处理');
+    %% ---------------- 主循环：逐慢时间计算并积累 ----------------
+    for i = 1:Na
+        % 当前慢时间对应的一条距离向数据
+        s_temp = s1(i, :);   % [1, Nr_up]
 
-amsum = gpuArray.zeros(size(xp2));   % 存储幅度
+        % 仅计算当前慢时间 i 对应的所有像素等效单程斜距 rp(:,:,i)
+        rp = calc_Rm_one_slowtime_nonstopgo(xp2, yp2, zp2, ParaCBP, i);   % [Ny, Nx]
 
-for i = 1:Na
-    s_temp = s1(i,:);
+        % 送GPU
+        rp_gpu = gpuArray(rp);
 
-    % 当前方位向（当前PRT）下，所有网格点的非停走等效单程斜距
-    rp = Rm_all(:,:,i);
+        % 斜距 -> 距离向采样点索引
+        n_round = round((rp_gpu - r_start) ./ delta_r + 1);
 
-    n_round = round((rp - r_start) / delta_r + 1);
-    n_round(n_round < 1)    = 1;
-    n_round(n_round > Nr_up)= Nr_up;
+        % 越界裁剪
+        n_round(n_round < 1)     = 1;
+        n_round(n_round > Nr_up) = Nr_up;
 
-    amsum = amsum + s_temp(n_round) .* exp(1j * 4 * pi * rp / lambda);
+        % BP积累
+        amsum_gpu = amsum_gpu + s_temp(n_round) .* exp(1j * 4 * pi * rp_gpu / lambda);
 
-    waitbar(i/Na, h, sprintf('%6.2f %%', i/Na*100));
-end
-delete(h)
+        % 更新进度条
+        elapsed_sec = toc(t_start);
+        ratio = i / Na;
+        if ratio > 0
+            remain_sec = elapsed_sec * (1 - ratio) / ratio;
+        else
+            remain_sec = inf;
+        end
 
-%% 相位补偿（保相）
-midIdx = round(Na/2) + 1;
-rp_middle = Rm_all(:,:,midIdx);
-amsum_new = amsum .* exp(-1i * 4 * pi * rp_middle / lambda);
+        msg = sprintf(['慢时间进度: %d / %d (%.2f%%)\n' ...
+                       '已耗时: %s\n' ...
+                       '预计剩余: %s'], ...
+                       i, Na, ratio*100, ...
+                       sec2str(elapsed_sec), sec2str(remain_sec));
 
-amsum     = gather(amsum);
-amsum_new = gather(amsum_new);
-rp_middle = gather(rp_middle);
-
-end
-
-function Rm_all = calc_Rm_all_nonstopgo(xp2, yp2, zp2, ParaCBP)
-
-[Ny, Nx] = size(xp2);
-Na = ParaCBP.Na;
-Np = Ny * Nx;
-
-% 拉平成列向量，便于 parfor
-xp_vec = xp2(:);
-yp_vec = yp2(:);
-zp_vec = zp2(:);
-
-% 每个像素对应一条 Na×1 的 Rm 曲线
-% 为了适配 parfor，这里先存成 Np×Na
-Rm_mat = zeros(Np, Na);
-
-% ========= 新增：parfor进度条 =========
-h = waitbar(0, '开始计算 Rm_all ...', 'Name', '非停走斜距计算');
-dq = parallel.pool.DataQueue;
-numDone = 0;
-updateStep = max(1, floor(Np / 200));   % 大约更新200次
-
-afterEach(dq, @updateWaitbar);
-
-    function updateWaitbar(n)
-        numDone = numDone + n;
-        waitbar(min(numDone / Np, 1), h, ...
-            sprintf('Rm计算中: %d / %d (%.2f%%)', ...
-            numDone, Np, min(numDone / Np, 1) * 100));
+        if isgraphics(h)
+            waitbar(ratio, h, msg);
+        end
+        drawnow limitrate;
     end
-% ====================================
+    %% 相位补偿（保相）
 
-parfor p = 1:Np
-    Tar_xyz = [xp_vec(p); yp_vec(p); zp_vec(p)];
-    Rm_mat(p, :) = calc_one_pixel_Rm_nonstopgo(Tar_xyz, ParaCBP).';
-    if mod(p, updateStep) == 0
-        send(dq, updateStep);
+    i_mid = round(Na/2);
+    rp_middle = calc_Rm_one_slowtime_nonstopgo(xp2, yp2, zp2, ParaCBP, i_mid);
+    amsum_new = amsum_gpu .* exp(-1i * 4 * pi * rp_middle / lambda);
+
+    amsum = gather(amsum_gpu);   % 复图像
+    amsum_new = gather(amsum_new);
+    rp_middle = gather(rp_middle);
+
+end
+
+
+%% ========================================================================
+function rp = calc_Rm_one_slowtime_nonstopgo(xp2, yp2, zp2, ParaCBP, i_slow)
+% 计算“当前第 i_slow 个慢时间”对应的所有网格点等效单程斜距
+% 输出：
+%   rp [Ny, Nx]
+
+    [Ny, Nx] = size(xp2);
+    Np = Ny * Nx;
+
+    xp_vec = xp2(:);
+    yp_vec = yp2(:);
+    zp_vec = zp2(:);
+
+    rp_vec = zeros(Np, 1, 'like', xp_vec);
+
+    % parfor 按像素并行
+    parfor p = 1:Np
+        Tar_xyz = [xp_vec(p); yp_vec(p); zp_vec(p)];
+        rp_vec(p) = calc_one_pixel_Rm_one_slowtime(Tar_xyz, ParaCBP, i_slow);
     end
-end
-% 补上最后不足 updateStep 的部分
-remain = mod(Np, updateStep);
-if remain ~= 0
-    send(dq, remain);
-end
-% 关闭进度条
-if isvalid(h)
-    close(h);
-end
-% 再恢复成 Ny×Nx×Na
-Rm_all = zeros(Ny, Nx, Na);
-for k = 1:Na
-    Rm_all(:,:,k) = reshape(Rm_mat(:,k), Ny, Nx);
+
+    rp = reshape(rp_vec, Ny, Nx);
 end
 
-end
 
-function Rm_vec = calc_one_pixel_Rm_nonstopgo(Tar_xyz, ParaCBP)
+%% ========================================================================
+function Rm_val = calc_one_pixel_Rm_one_slowtime(Tar_xyz, ParaCBP, i_slow)
+% 单像素、单慢时间：只求当前 i_slow 对应的等效单程斜距
+%
+% 三个关键时刻：
+%   t1 : 发射时刻（当前慢时间）
+%   t2 : 到达目标时刻
+%   t3 : 返回雷达时刻
+%
+% 定义：
+%   R1 = |pt(t2) - pr(t1)|
+%   R2 = |pr(t3) - pt(t2)|
+%   Rm = (R1 + R2) / 2
 
-Na = ParaCBP.Na;
-Tr = ParaCBP.Tr;
-c0 = ParaCBP.c0;
+    %% ----- 读参数 -----
+    Tr = ParaCBP.Tr;
+    c0 = ParaCBP.c0;
 
-x_par_radar = ParaCBP.x_par_radar;
-y_par_radar = ParaCBP.y_par_radar;
-z_par_radar = ParaCBP.z_par_radar;
+    x_par_radar = ParaCBP.x_par_radar;
+    y_par_radar = ParaCBP.y_par_radar;
+    z_par_radar = ParaCBP.z_par_radar;
 
-a_psi   = ParaCBP.a_psi;
-b_psi   = ParaCBP.b_psi;
-c_psi   = ParaCBP.c_psi;
-d_psi   = ParaCBP.d_psi;
+    a_psi   = ParaCBP.a_psi;
+    b_psi   = ParaCBP.b_psi;
+    c_psi   = ParaCBP.c_psi;
+    d_psi   = ParaCBP.d_psi;
 
-a_theta = ParaCBP.a_theta;
-b_theta = ParaCBP.b_theta;
-c_theta = ParaCBP.c_theta;
-d_theta = ParaCBP.d_theta;
+    a_theta = ParaCBP.a_theta;
+    b_theta = ParaCBP.b_theta;
+    c_theta = ParaCBP.c_theta;
+    d_theta = ParaCBP.d_theta;
 
-a_phi   = ParaCBP.a_phi;
-b_phi   = ParaCBP.b_phi;
-c_phi   = ParaCBP.c_phi;
-d_phi   = ParaCBP.d_phi;
+    a_phi   = ParaCBP.a_phi;
+    b_phi   = ParaCBP.b_phi;
+    c_phi   = ParaCBP.c_phi;
+    d_phi   = ParaCBP.d_phi;
 
-t1_vec = (0:Na-1).' * Tr;
-Rm_vec = zeros(Na,1);
+    %% ----- 当前慢时间发射时刻 -----
+    t1 = (i_slow - 1) * Tr;
 
-% ---------- 欧拉角函数 ----------
-psi_fun   = @(t) d_psi   * t.^3 + c_psi   * t.^2 + b_psi   * t + a_psi;
-theta_fun = @(t) d_theta * t.^3 + c_theta * t.^2 + b_theta * t + a_theta;
-phi_fun   = @(t) d_phi   * t.^3 + c_phi   * t.^2 + b_phi   * t + a_phi;
+    %% ----- 欧拉角函数 -----
+    psi_fun   = @(t) d_psi   * t.^3 + c_psi   * t.^2 + b_psi   * t + a_psi;
+    theta_fun = @(t) d_theta * t.^3 + c_theta * t.^2 + b_theta * t + a_theta;
+    phi_fun   = @(t) d_phi   * t.^3 + c_phi   * t.^2 + b_phi   * t + a_phi;
 
-% ---------- 基本旋转矩阵 ----------
-Rz = @(ang) [ cos(ang),  sin(ang), 0;
-             -sin(ang),  cos(ang), 0;
-                   0   ,      0   , 1 ];
+    %% ----- 坐标旋转 -----
+    Rz = @(ang) [ cos(ang),  sin(ang), 0;
+                 -sin(ang),  cos(ang), 0;
+                       0   ,      0   , 1 ];
 
-Rx = @(ang) [1,     0     ,      0    ;
-             0, cos(ang),  sin(ang);
-             0, -sin(ang), cos(ang)];
+    Rx = @(ang) [1,     0     ,      0    ;
+                 0, cos(ang),  sin(ang);
+                 0, -sin(ang), cos(ang)];
 
-% ---------- MCMF -> MCI ----------
-tran = @(t) Rz(psi_fun(t)) * Rx(theta_fun(t)) * Rz(phi_fun(t));
+    tran = @(t) Rz(psi_fun(t)) * Rx(theta_fun(t)) * Rz(phi_fun(t));
 
-% ---------- 雷达 MCI 坐标函数 ----------
-xr_fun = @(t) x_par_radar(1)*t.^3 + x_par_radar(2)*t.^2 + x_par_radar(3)*t + x_par_radar(4);
-yr_fun = @(t) y_par_radar(1)*t.^3 + y_par_radar(2)*t.^2 + y_par_radar(3)*t + y_par_radar(4);
-zr_fun = @(t) z_par_radar(1)*t.^3 + z_par_radar(2)*t.^2 + z_par_radar(3)*t + z_par_radar(4);
-pr_fun = @(t) [xr_fun(t); yr_fun(t); zr_fun(t)];
+    %% ----- 雷达轨迹函数 -----
+    xr_fun = @(t) x_par_radar(1)*t.^3 + x_par_radar(2)*t.^2 + x_par_radar(3)*t + x_par_radar(4);
+    yr_fun = @(t) y_par_radar(1)*t.^3 + y_par_radar(2)*t.^2 + y_par_radar(3)*t + y_par_radar(4);
+    zr_fun = @(t) z_par_radar(1)*t.^3 + z_par_radar(2)*t.^2 + z_par_radar(3)*t + z_par_radar(4);
 
-% ---------- 目标在 MCI 下的位置函数 ----------
-pt_fun = @(t) tran(t) * Tar_xyz;
+    pr_fun = @(t) [xr_fun(t); yr_fun(t); zr_fun(t)];
+    pt_fun = @(t) tran(t) * Tar_xyz;
 
-tau12_prev = 1.3;
-tau23_prev = 1.3;
-
-for k = 1:Na
-    t1 = t1_vec(k);
+    %% ----- 已知发射时刻雷达位置 -----
     pr_t1 = pr_fun(t1);
 
-    %% ---------- 求 t2 ----------
+    %% ===================== 求 t2 =====================
+    % 去程传播约束：
+    % |pt(t2) - pr(t1)| = c0 * (t2 - t1)
     fun_t2 = @(t) norm(pt_fun(t) - pr_t1) - c0 * (t - t1);
 
-    if k == 1
-        R1_init = norm(pt_fun(t1) - pr_t1);
-        t2_init = t1 + R1_init / c0;
-    else
-        t2_init = t1 + tau12_prev;
-    end
+    % 初值：用 t1 时刻雷达到目标的近似直线距离
+    R1_init = norm(pt_fun(t1) - pr_t1);
+    t2_init = t1 + R1_init / c0;
 
     t2 = local_fzero_with_expand(fun_t2, t2_init, t1, t1 + 5.0);
 
     pt_t2 = pt_fun(t2);
     R1 = norm(pt_t2 - pr_t1);
 
-    %% ---------- 求 t3 ----------
+    %% ===================== 求 t3 =====================
+    % 回程传播约束：
+    % |pr(t3) - pt(t2)| = c0 * (t3 - t2)
     fun_t3 = @(t) norm(pr_fun(t) - pt_t2) - c0 * (t - t2);
 
-    if k == 1
-        t3_init = t2 + R1 / c0;
-    else
-        t3_init = t2 + tau23_prev;
-    end
+    t3_init = t2 + R1 / c0;
 
     t3 = local_fzero_with_expand(fun_t3, t3_init, t2, t2 + 5.0);
 
     pr_t3 = pr_fun(t3);
     R2 = norm(pr_t3 - pt_t2);
 
-    %% ---------- 等效单程斜距 ----------
-    Rm_vec(k) = (R1 + R2) / 2;
-
-    tau12_prev = t2 - t1;
-    tau23_prev = t3 - t2;
-end
+    % ----- 等效单程斜距 -----
+    Rm_val = (R1 + R2) / 2;
 
 end
 
@@ -271,4 +281,35 @@ if ~isempty(idx)
 end
 
 error('fzero 求根失败：在给定区间内没有找到可靠根。');
+end
+
+
+%% ========================================================================
+function str = sec2str(sec_in)
+% 秒数转字符串
+    if ~isfinite(sec_in)
+        str = '未知';
+        return;
+    end
+
+    sec_in = max(sec_in, 0);
+
+    hh = floor(sec_in / 3600);
+    mm = floor((sec_in - hh*3600) / 60);
+    ss = sec_in - hh*3600 - mm*60;
+
+    if hh > 0
+        str = sprintf('%02d:%02d:%05.2f', hh, mm, ss);
+    else
+        str = sprintf('%02d:%05.2f', mm, ss);
+    end
+end
+
+
+%% ========================================================================
+function safeCloseWaitbar(h)
+% 安全关闭进度条
+    if ~isempty(h) && isgraphics(h)
+        close(h);
+    end
 end
